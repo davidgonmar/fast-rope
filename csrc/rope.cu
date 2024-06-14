@@ -6,10 +6,6 @@ constexpr size_t MAX_BLOCKS_X = 65535;
 constexpr size_t MAX_BLOCKS_Y = 65535;
 
 
-__device__ __forceinline__ cuFloatComplex complex_exp(const cuFloatComplex& z) {
-    const float exp_real = expf(cuCrealf(z));
-    return make_cuFloatComplex(exp_real * cosf(cuCimagf(z)), exp_real * sinf(cuCimagf(z)));
-}
 
 __global__ void rope_kernel(
     const float* __restrict__ sequence,
@@ -32,19 +28,16 @@ __global__ void rope_kernel(
                 // now handle x as a complex number
                 const cuFloatComplex x = make_cuFloatComplex(x1, x2);
                 // load the corresponding frequency
-                const float f1 = freqs[seq_idx * d_model + d_idx];
-                const float f2 = freqs[seq_idx * d_model + d_idx + 1];
-                const cuFloatComplex f = make_cuFloatComplex(f1, f2);
+                const float f1 = freqs[(seq_idx * d_model / 2) + d_idx / 2];
+                const cuFloatComplex f = make_cuFloatComplex(cosf(f1), sinf(f1)); // into polar form
                 // we need to exp the frequency
-                const cuFloatComplex x_rot = cuCmulf(x, complex_exp(f));
+                const cuFloatComplex x_rot = cuCmulf(x, f);
 
                 output[batch_idx * seq_len * d_model + seq_idx * d_model + d_idx] = cuCrealf(x_rot);
                 output[batch_idx * seq_len * d_model + seq_idx * d_model + d_idx + 1] = cuCimagf(x_rot);
             }
         }
-    }
-
-    
+    } 
 }
 
 
@@ -62,8 +55,8 @@ torch::Tensor rope_forward(
 
 
     // Check sequence and freqs have the same shape except batch_size
-    TORCH_CHECK(sequence.size(1) == freqs.size(0), "sequence and freqs must have the same shape except batch_size");
-    TORCH_CHECK(sequence.size(2) == freqs.size(1), "sequence and freqs must have the same shape except batch_size");
+    TORCH_CHECK(sequence.size(1) == freqs.size(0), "sequence and freqs must have the same shape seq_len");
+    TORCH_CHECK(sequence.size(2) == freqs.size(1) * 2, "sequence must have double the size of freqs in the last dimension");
 
 
     const dim3 grid_size(

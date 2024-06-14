@@ -5,6 +5,40 @@ import rope_cuda
 device = torch.device("cuda")
 
 
+
+
+class RotaryEmbeddingFast(nn.Module):
+    """
+    Positional encoding to add to embeddings introduced in "Rotary Positional Embedding".
+
+    """
+
+    def __init__(self, d_model: int, seq_len: int, dropout: float) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.seq_len = seq_len
+        thetas = torch.arange(0, d_model // 2, dtype=torch.float)  # (d_model // 2)
+        thetas = 10000 ** (-2 * (thetas - 1) / d_model)  # (d_model // 2)
+        freqs = torch.outer(
+            torch.arange(0, seq_len, dtype=torch.float), thetas
+        )  # (seq_len, d_model // 2)
+        # angular wrapping to avoid large values, wont affect the rotation
+        freqs = freqs % (2 * torch.pi)
+
+        self.register_buffer("freqs", freqs)
+
+    @staticmethod
+    def _apply_rotary_emb(x: Tensor, freqs: Tensor) -> Tensor:
+        return rope_cuda.rope_forward(x, freqs)
+
+    def forward(self, x: Tensor) -> Tensor:
+        device = x.device
+        if device != self.freqs.device:
+            self.freqs = self.freqs.to(device)
+        return self._apply_rotary_emb(x, self.freqs)
+
+
+
 class RotaryEmbeddingNaive(nn.Module):
     """
     Positional encoding to add to embeddings introduced in "Rotary Positional Embedding".
@@ -22,8 +56,6 @@ class RotaryEmbeddingNaive(nn.Module):
         # where i = 0, 1, ..., d/2
         # so repeat interleave thetas to go from
         # (mt1, mt2, ..., mtd/2) to (mt1, mt1, mt2, mt2, ..., mtd/2, mtd/2)
-        thetas = thetas.repeat_interleave(2)  # (d_model // 2)
-
         freqs = torch.outer(
             torch.arange(0, seq_len, dtype=torch.float), thetas
         )  # (seq_len, d_model)
@@ -31,11 +63,8 @@ class RotaryEmbeddingNaive(nn.Module):
         # angular wrapping to avoid large values, wont affect the rotation
         freqs = freqs % (2 * torch.pi)
 
-        freqs = torch.view_as_complex(
-            freqs.reshape(seq_len, d_model // 2, 2)  # (seq_len, d_model // 2, 2)
-        )  # (seq_len, d_model // 2)
-
-        freqs = torch.exp(freqs)  # now freqs is of the for
+        freqs = torch.polar(torch.ones_like(freqs), freqs)
+        
         # [[exp(i * m0 * theta0), exp(i * m0 * theta1), ..., exp(i * m0 * theta2), exp(i * m0 * theta3), ...]
         # [exp(i * m1 * theta0), exp(i * m1 * theta1), ..., exp(i * m1 * theta2), exp(i * m1 * theta3), ...]]
         # where m0, m1, ... are the positions and theta0, theta1, ... are the thetas
@@ -70,44 +99,6 @@ class RotaryEmbeddingNaive(nn.Module):
         if x.device != self.freqs.device:
             self.freqs = self.freqs.to(x.device)
         return self._apply_rotary_emb(x, self.freqs)
-
-
-class RotaryEmbeddingFast(nn.Module):
-    """
-    Positional encoding to add to embeddings introduced in "Rotary Positional Embedding".
-
-    """
-
-    def __init__(self, d_model: int, seq_len: int, dropout: float) -> None:
-        super().__init__()
-        self.d_model = d_model
-        self.seq_len = seq_len
-        thetas = torch.arange(0, d_model // 2, dtype=torch.float)  # (d_model // 2)
-        thetas = 10000 ** (-2 * (thetas - 1) / d_model)  # (d_model // 2)
-        # pos must be like (mt1, mt1, mt2, mt2, ..., mtd/2, mtd/2) (t = theta)
-        # where i = 0, 1, ..., d/2
-        # so repeat interleave thetas to go from
-        # (mt1, mt2, ..., mtd/2) to (mt1, mt1, mt2, mt2, ..., mtd/2, mtd/2)
-        thetas = thetas.repeat_interleave(2)
-
-        freqs = torch.outer(
-            torch.arange(0, seq_len, dtype=torch.float), thetas
-        )  # (seq_len, d_model)
-        # angular wrapping to avoid large values, wont affect the rotation
-        freqs = freqs % (2 * torch.pi)
-
-        self.register_buffer("freqs", freqs)
-
-    @staticmethod
-    def _apply_rotary_emb(x: Tensor, freqs: Tensor) -> Tensor:
-        return rope_cuda.rope_forward(x, freqs)
-
-    def forward(self, x: Tensor) -> Tensor:
-        device = x.device
-        if device != self.freqs.device:
-            self.freqs = self.freqs.to(device)
-        return self._apply_rotary_emb(x, self.freqs)
-
 
 class RotaryEmbeddingNaive2(nn.Module):
     """
@@ -180,11 +171,12 @@ if __name__ == "__main__":
     y_naive2 = rotary_emb_naive2(x)
     torch.cuda.synchronize()
     torch.testing.assert_close(
-        y_naive, y_fast, equal_nan=True, rtol=1e-2, atol=1e-2
-    )  # maybe figure out better tolerances
-    torch.testing.assert_close(
         y_naive, y_naive2, equal_nan=True, rtol=1e-2, atol=1e-2
     )  # maybe figure out better tolerances
+    torch.testing.assert_close(
+        y_naive, y_fast, equal_nan=True, rtol=1e-2, atol=1e-2
+    )  # maybe figure out better tolerances
+
     # then benchmark
     import time
     import numpy as np
@@ -216,4 +208,7 @@ if __name__ == "__main__":
 
     print("Naive mean time:", np.mean(times_naive))
     print("Fast mean time:", np.mean(times_fast))
-    print("Speedup:", np.mean(times_naive) / np.mean(times_fast))
+    print("Naive2 mean time:", np.mean(times_naive2))
+
+    print("Speedup wrt naive:", np.mean(times_naive) / np.mean(times_fast))
+    print("Speedup wrt naive2:", np.mean(times_naive2) / np.mean(times_fast))
