@@ -16,19 +16,21 @@ __global__ void rope_kernel(
 ) {
     // input and output are both of shape (batch_size, seq_len, d_model)
 
-    for (size_t batch_idx = blockIdx.x; batch_idx < batch_size; batch_idx += gridDim.x) {
+    
         for (size_t seq_idx = blockIdx.y; seq_idx < seq_len; seq_idx += gridDim.y) {
             // d_idx 2 by 2
             for (size_t d_idx = threadIdx.x * 2; d_idx < d_model; d_idx += blockDim.x * 2) {
+                const float theta = powf(10000.0f, -2.0f * float(float(d_idx / 2) - 1) / float(d_model));
+                const float f1 = theta * float(seq_idx);
+                const cuFloatComplex f = make_cuFloatComplex(cosf(f1), sinf(f1)); // into polar form
+                for (size_t batch_idx = blockIdx.x; batch_idx < batch_size; batch_idx += gridDim.x) {
                 // first, load d_idx and d_idx + 1 from sequence
                 const float x1 = sequence[batch_idx * seq_len * d_model + seq_idx * d_model + d_idx];
                 const float x2 = sequence[batch_idx * seq_len * d_model + seq_idx * d_model + d_idx + 1];
                 // now handle x as a complex number
                 const cuFloatComplex x = make_cuFloatComplex(x1, x2);
                 // compute the frequency on the fly
-                const float theta = powf(10000.0f, -2.0f * float(float(d_idx / 2) - 1) / float(d_model));
-                const float f1 = theta * float(seq_idx);
-                const cuFloatComplex f = make_cuFloatComplex(cosf(f1), sinf(f1)); // into polar form
+                
                 // we need to exp the frequency
                 const cuFloatComplex x_rot = cuCmulf(x, f);
 
